@@ -3,11 +3,10 @@ use std::io;
 
 pub struct TcpWarpProto;
 
-impl Encoder for TcpWarpProto {
-    type Item = TcpWarpMessage;
+impl Encoder<TcpWarpMessage> for TcpWarpProto {
     type Error = io::Error;
 
-    fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> io::Result<()> {
+    fn encode(&mut self, item: TcpWarpMessage, dst: &mut BytesMut) -> io::Result<()> {
         match item {
             TcpWarpMessage::AddPorts(ports) => {
                 dst.reserve(1 + 2 + ports.len() * 2);
@@ -248,11 +247,10 @@ pub struct TcpWarpProtoClient {
     pub connection_id: Uuid,
 }
 
-impl Encoder for TcpWarpProtoClient {
-    type Item = BytesMut;
+impl Encoder<BytesMut> for TcpWarpProtoClient {
     type Error = io::Error;
 
-    fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> io::Result<()> {
+    fn encode(&mut self, item: BytesMut, dst: &mut BytesMut) -> io::Result<()> {
         dst.extend_from_slice(&item);
         Ok(())
     }
@@ -278,11 +276,10 @@ pub struct TcpWarpProtoHost {
     pub connection_id: Uuid,
 }
 
-impl Encoder for TcpWarpProtoHost {
-    type Item = BytesMut;
+impl Encoder<BytesMut> for TcpWarpProtoHost {
     type Error = io::Error;
 
-    fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> io::Result<()> {
+    fn encode(&mut self, item: BytesMut, dst: &mut BytesMut) -> io::Result<()> {
         dst.extend_from_slice(&item);
         Ok(())
     }

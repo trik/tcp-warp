@@ -38,7 +38,7 @@ impl TcpWarpClient {
             };
             addresses = addrs;
             warn!("retrying in {:?}", retry_delay);
-            delay_for(retry_delay).await;
+            sleep(retry_delay).await;
         }
 
         Ok(())
@@ -58,14 +58,14 @@ impl TcpWarpClient {
         };
         let (mut wtransport, mut rtransport) = Framed::new(stream, TcpWarpProto).split();
 
-        let (mut sender, mut receiver) = channel(100);
+        let (sender, mut receiver) = channel(100);
 
         let forward_task = async move {
             debug!("in receiver task");
 
             let mut listeners = vec![];
 
-            while let Some(message) = receiver.next().await {
+            while let Some(message) = receiver.recv().await {
                 debug!("just received a message connect: {:?}", message);
                 let message = match message {
                     TcpWarpMessage::Connect {
@@ -76,7 +76,7 @@ impl TcpWarpClient {
                     } => {
                         debug!("adding connection: {}", connection_id);
                         connections.insert(
-                            connection_id.clone(),
+                            connection_id,
                             TcpWarpConnection {
                                 sender,
                                 connected_sender: Some(connected_sender),
@@ -101,7 +101,7 @@ impl TcpWarpClient {
                         break;
                     }
                     TcpWarpMessage::DisconnectHost { ref connection_id } => {
-                        if let Some(mut connection) = connections.remove(connection_id) {
+                        if let Some(connection) = connections.remove(connection_id) {
                             if let Err(err) = connection.sender.send(message).await {
                                 error!("cannot send to channel: {}", err);
                             }
@@ -131,7 +131,7 @@ impl TcpWarpClient {
                         continue;
                     }
                     TcpWarpMessage::Connected { ref connection_id } => {
-                        if let Some(connection) = connections.get_mut(&connection_id) {
+                        if let Some(connection) = connections.get_mut(connection_id) {
                             debug!("start connected loop: {}", connection_id);
                             if let Some(connection_sender) = connection.connected_sender.take() {
                                 if let Err(err) = connection_sender.send(Ok(())) {
@@ -189,7 +189,7 @@ impl TcpWarpClient {
                     addresses.clone(),
                     bind_address,
                 )
-                .await?;
+                    .await?;
             }
 
             debug!("processing task for host to client finished");
@@ -210,7 +210,7 @@ impl TcpWarpClient {
 // async fn publish
 async fn process_host_to_client_message(
     message: TcpWarpMessage,
-    mut sender: Sender<TcpWarpMessage>,
+    sender: Sender<TcpWarpMessage>,
     addresses: Arc<Vec<TcpWarpPortConnection>>,
     bind_address: IpAddr,
 ) -> Result<(), io::Error> {
@@ -223,7 +223,7 @@ async fn process_host_to_client_message(
                     SocketAddr::new(bind_address, address.client_port.unwrap_or(address.port));
                 let sender_ = sender.clone();
 
-                let mut listener = match TcpListener::bind(bind_address).await {
+                let listener = match TcpListener::bind(bind_address).await {
                     Ok(listener) => listener,
                     Err(err) => {
                         error!("could not start listen {}: {}", bind_address, err);
@@ -234,9 +234,8 @@ async fn process_host_to_client_message(
                 debug!("listen: {:?}", bind_address);
 
                 let abortable_feature = async move {
-                    let mut incoming = listener.incoming();
-
-                    while let Some(Ok(stream)) = incoming.next().await {
+                    loop {
+                        let (stream, _addr) = listener.accept().await?;
                         let sender__ = sender_.clone();
 
                         let _address = address.clone();
@@ -247,10 +246,11 @@ async fn process_host_to_client_message(
                         });
                     }
 
-                    debug!("done listen: {:?}", bind_address);
-
+                    // We need it to infer the return type of the closure, otherwise the ? notation doesn't work
+                    #[allow(unreachable_code)]
                     Ok::<(), io::Error>(())
                 };
+
                 let (abortable_listener, abort_handler) = abortable(abortable_feature);
                 if let Err(err) = sender.send(TcpWarpMessage::Listener(abort_handler)).await {
                     error!("cannot send message Listener to forward channel: {}", err);
@@ -291,7 +291,7 @@ async fn process_host_to_client_message(
 
 async fn process(
     stream: TcpStream,
-    mut host_sender: Sender<TcpWarpMessage>,
+    host_sender: Sender<TcpWarpMessage>,
     address: TcpWarpPortConnection,
 ) -> Result<(), Box<dyn Error>> {
     let connection_id = Uuid::new_v4();
@@ -305,7 +305,7 @@ async fn process(
 
     let forward_task = async move {
         debug!("in receiver task");
-        while let Some(message) = client_receiver.next().await {
+        while let Some(message) = client_receiver.recv().await {
             debug!(
                 "{} just received a message process: {:?}",
                 connection_id, message

@@ -1,31 +1,45 @@
 use super::*;
 
 pub struct TcpWarpServer {
-    listen_address: SocketAddr,
     connect_address: IpAddr,
+    listener: TcpListener,
 }
 
 impl TcpWarpServer {
-    pub fn new(listen_address: SocketAddr, connect_address: IpAddr) -> Self {
-        Self {
-            listen_address,
+    /**
+    Creates a new TcpWarpServer, which will be bound to the specified address.
+    The returned server is ready to start listening for connections.
+    Binding with a port number of 0 will request that the OS assigns a port to this listener. The port allocated can be queried via the local_addr method.
+    */
+    pub async fn bind(listen_address: &SocketAddr, connect_address: IpAddr) -> io::Result<Self> {
+        let listener = TcpListener::bind(listen_address).await?;
+        Ok(Self {
             connect_address,
-        }
+            listener,
+        })
+    }
+    /**
+    Returns the local address that this server is bound to.
+    This can be useful, for example, when binding to port 0 to figure out which port was actually bound.
+    */
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
     }
 
-    pub async fn listen(&self) -> Result<(), Box<dyn Error>> {
-        let mut listener = TcpListener::bind(&self.listen_address).await?;
-        let mut incoming = listener.incoming();
+    /**
+    Start processing connections from this server.
+    This function will await indefinitely until the future is cancelled
+    */
+    pub async fn listen(&self) -> io::Result<()> {
         let connect_address = self.connect_address;
-
-        while let Some(Ok(stream)) = incoming.next().await {
+        loop {
+            let (stream, _addr) = self.listener.accept().await?;
             spawn(async move {
                 if let Err(e) = process(stream, connect_address).await {
                     println!("failed to process connection; error = {}", e);
                 }
             });
-        }
-        Ok(())
+        };
     }
 }
 
@@ -42,7 +56,7 @@ async fn process(stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<d
 
     let forward_task = async move {
         debug!("in receiver task process");
-        while let Some(message) = receiver.next().await {
+        while let Some(message) = receiver.recv().await {
             debug!("received in fw message: {:?}", message);
             let message = match message {
                 TcpWarpMessage::ConnectForward {
@@ -54,7 +68,7 @@ async fn process(stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<d
                     if let Err(err) = connected_sender.send(Ok(())) {
                         error!("connected sender errored: {:?}", err);
                     }
-                    connections.insert(connection_id.clone(), sender.clone());
+                    connections.insert(connection_id, sender.clone());
                     TcpWarpMessage::Connected { connection_id }
                 }
                 TcpWarpMessage::DisconnectClient { ref connection_id } => {
@@ -62,7 +76,7 @@ async fn process(stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<d
                         "{} client connection disconnected, handle server disconnect",
                         connection_id
                     );
-                    if let Some(mut sender) = connections.remove(connection_id) {
+                    if let Some(sender) = connections.remove(connection_id) {
                         if let Err(err) = sender.send(message).await {
                             error!("cannot send to channel: {}", err);
                         }
@@ -106,7 +120,7 @@ async fn process(stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<d
         while let Some(Ok(message)) = rtransport.next().await {
             debug!("server received from tunnel client {:?}", message);
             if let Err(err) =
-                process_client_to_host_message(message, sender.clone(), connect_address).await
+            process_client_to_host_message(message, sender.clone(), connect_address).await
             {
                 error!("error in processing: {}", err);
             }
@@ -126,7 +140,7 @@ async fn process(stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<d
 
 async fn process_client_to_host_message(
     message: TcpWarpMessage,
-    mut client_sender: Sender<TcpWarpMessage>,
+    client_sender: Sender<TcpWarpMessage>,
     connect_address: IpAddr,
 ) -> Result<(), io::Error> {
     match message {
@@ -145,7 +159,7 @@ async fn process_client_to_host_message(
                 );
                 debug!("host connection to {}", socket_address);
                 if let Err(err) =
-                    process_host_connection(client_sender_, connection_id, socket_address).await
+                process_host_connection(client_sender_, connection_id, socket_address).await
                 {
                     error!(
                         "failed connection {} {}: {}",
@@ -176,7 +190,7 @@ async fn process_client_to_host_message(
 }
 
 async fn process_host_connection<S: ToSocketAddrs>(
-    mut client_sender: Sender<TcpWarpMessage>,
+    client_sender: Sender<TcpWarpMessage>,
     connection_id: Uuid,
     socket_address: S,
 ) -> Result<(), Box<dyn Error>> {
@@ -200,7 +214,7 @@ async fn process_host_connection<S: ToSocketAddrs>(
     let forward_task = async move {
         debug!("{} in receiver task process_host_connection", connection_id);
 
-        while let Some(message) = host_receiver.next().await {
+        while let Some(message) = host_receiver.recv().await {
             debug!("{} just received a message: {:?}", connection_id, message);
             match message {
                 TcpWarpMessage::DisconnectClient { .. } => break,
@@ -232,7 +246,7 @@ async fn process_host_connection<S: ToSocketAddrs>(
 
     debug!("{} sended connect to client", connection_id);
 
-    let mut client_sender_ = client_sender.clone();
+    let client_sender_ = client_sender.clone();
 
     let processing_task = async move {
         if let Err(err) = connected_receiver.await {

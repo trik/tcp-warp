@@ -171,6 +171,7 @@ use futures::{
 };
 use log::*;
 use std::{
+    io,
     collections::HashMap,
     convert::TryInto,
     error::Error,
@@ -181,13 +182,12 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    prelude::*,
     spawn,
     sync::{
         mpsc::{channel, Sender},
         oneshot,
     },
-    time::delay_for,
+    time::sleep,
 };
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use uuid::Uuid;

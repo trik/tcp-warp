@@ -3,7 +3,7 @@ name = 'tcpwarp'
 
 [package]
 name = 'tcp-warp'
-version = '0.2.0'
+version = '0.3.0'
 authors = ['Alexander Korolev <kilork@yandex.ru>']
 edition = '2018'
 description = '''
@@ -34,26 +34,27 @@ branch = 'master'
 status = 'actively-developed'
 
 [dependencies]
-bytes = '0.5'
+bytes = '1'
 futures = '0.3'
 log = '0.4'
 
 [dependencies.uuid]
-version = '0.8'
+version = '1'
 features = ['v4']
 
 [dependencies.tokio]
-version = '0.2'
+version = '1'
 features = [
-    'dns',
+    'net',
     'io-util',
-    'tcp',
-    'rt-core',
+    'rt',
     'sync',
-    'stream',
     'time',
 ]
 
+[dependencies.tokio-stream]
+version = "0.1"
+
 [dependencies.tokio-util]
-version = '0.2'
+version = '0.7'
 features = ['codec']
