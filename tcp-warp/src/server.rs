@@ -3,6 +3,7 @@ use super::*;
 pub struct TcpWarpServer {
     connect_address: IpAddr,
     listener: TcpListener,
+    shutdown: Shutdown,
 }
 
 impl TcpWarpServer {
@@ -11,11 +12,17 @@ impl TcpWarpServer {
     The returned server is ready to start listening for connections.
     Binding with a port number of 0 will request that the OS assigns a port to this listener. The port allocated can be queried via the local_addr method.
     */
-    pub async fn bind(listen_address: &SocketAddr, connect_address: IpAddr) -> io::Result<Self> {
+    pub async fn bind(listen_address: &SocketAddr, connect_address: IpAddr, shutdown: Option<Shutdown>) -> io::Result<Self> {
         let listener = TcpListener::bind(listen_address).await?;
+        let shutdown = if let Some(shutdown) = shutdown {
+            shutdown
+        } else {
+            Shutdown::new()
+        };
         Ok(Self {
             connect_address,
             listener,
+            shutdown,
         })
     }
     /**
@@ -32,14 +39,21 @@ impl TcpWarpServer {
     */
     pub async fn listen(&self) -> io::Result<()> {
         let connect_address = self.connect_address;
-        loop {
-            let (stream, _addr) = self.listener.accept().await?;
+        let shutdown = self.shutdown.clone();
+        while let Some(connection) = shutdown.wrap_cancel(self.listener.accept()).await {
+            let (stream, _address) = connection?;
             spawn(async move {
                 if let Err(e) = process(stream, connect_address).await {
                     println!("failed to process connection; error = {}", e);
                 }
             });
-        };
+        }
+        shutdown.wait_shutdown_complete().await;
+        Ok(())
+    }
+
+    pub fn stop(&self) -> () {
+        self.shutdown.shutdown();
     }
 }
 
