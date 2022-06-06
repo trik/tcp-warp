@@ -3,6 +3,7 @@ use super::*;
 pub struct TcpWarpServer {
     connect_address: IpAddr,
     listener: TcpListener,
+    shutdown: Shutdown,
 }
 
 impl TcpWarpServer {
@@ -11,11 +12,17 @@ impl TcpWarpServer {
     The returned server is ready to start listening for connections.
     Binding with a port number of 0 will request that the OS assigns a port to this listener. The port allocated can be queried via the local_addr method.
     */
-    pub async fn bind(listen_address: &SocketAddr, connect_address: IpAddr) -> io::Result<Self> {
+    pub async fn bind(listen_address: &SocketAddr, connect_address: IpAddr, shutdown: Option<Shutdown>) -> io::Result<Self> {
         let listener = TcpListener::bind(listen_address).await?;
+        let shutdown = if let Some(shutdown) = shutdown {
+            shutdown
+        } else {
+            Shutdown::new()
+        };
         Ok(Self {
             connect_address,
             listener,
+            shutdown,
         })
     }
     /**
@@ -32,18 +39,26 @@ impl TcpWarpServer {
     */
     pub async fn listen(&self) -> io::Result<()> {
         let connect_address = self.connect_address;
-        loop {
-            let (stream, _addr) = self.listener.accept().await?;
+        let shutdown = self.shutdown.clone();
+        while let Some(connection) = shutdown.wrap_cancel(self.listener.accept()).await {
+            let (stream, _address) = connection?;
+            let shutdown = self.shutdown.clone();
             spawn(async move {
-                if let Err(e) = process(stream, connect_address).await {
+                if let Some(Err(e)) = shutdown.wrap_cancel(process(shutdown.clone(), stream, connect_address)).await {
                     println!("failed to process connection; error = {}", e);
                 }
             });
-        };
+        }
+        shutdown.wait_shutdown_complete().await;
+        Ok(())
+    }
+
+    pub fn stop(&self) -> () {
+        self.shutdown.shutdown();
     }
 }
 
-async fn process(stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<dyn Error>> {
+async fn process(shutdown: Shutdown, stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<dyn Error>> {
     let mut transport = Framed::new(stream, TcpWarpProto);
 
     transport.send(TcpWarpMessage::AddPorts(vec![])).await?;
@@ -120,7 +135,7 @@ async fn process(stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<d
         while let Some(Ok(message)) = rtransport.next().await {
             debug!("server received from tunnel client {:?}", message);
             if let Err(err) =
-            process_client_to_host_message(message, sender.clone(), connect_address).await
+            process_client_to_host_message(shutdown.clone(), message, sender.clone(), connect_address).await
             {
                 error!("error in processing: {}", err);
             }
@@ -139,6 +154,7 @@ async fn process(stream: TcpStream, connect_address: IpAddr) -> Result<(), Box<d
 }
 
 async fn process_client_to_host_message(
+    shutdown: Shutdown,
     message: TcpWarpMessage,
     client_sender: Sender<TcpWarpMessage>,
     connect_address: IpAddr,
@@ -159,7 +175,7 @@ async fn process_client_to_host_message(
                 );
                 debug!("host connection to {}", socket_address);
                 if let Err(err) =
-                process_host_connection(client_sender_, connection_id, socket_address).await
+                process_host_connection(shutdown, client_sender_, connection_id, socket_address).await
                 {
                     error!(
                         "failed connection {} {}: {}",
@@ -190,20 +206,22 @@ async fn process_client_to_host_message(
 }
 
 async fn process_host_connection<S: ToSocketAddrs>(
+    shutdown: Shutdown,
     client_sender: Sender<TcpWarpMessage>,
     connection_id: Uuid,
     socket_address: S,
 ) -> Result<(), Box<dyn Error>> {
     debug!("{} new connection", connection_id);
 
-    let stream = match TcpStream::connect(socket_address).await {
-        Ok(stream) => stream,
-        Err(err) => {
+    let stream = match shutdown.clone().wrap_cancel(TcpStream::connect(socket_address)).await {
+        Some(Ok(stream)) => stream,
+        Some(Err(err)) => {
             client_sender
                 .send(TcpWarpMessage::ConnectFailure { connection_id })
                 .await?;
             return Err(err.into());
-        }
+        },
+        None => return Err(Box::new(io::Error::new(io::ErrorKind::Other, "")))
     };
 
     let (mut wtransport, mut rtransport) =

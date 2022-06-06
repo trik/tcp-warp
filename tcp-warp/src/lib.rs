@@ -163,6 +163,7 @@ Simple example with `whoami` service:
     ```
 
 */
+use async_shutdown::Shutdown;
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{
     future::{abortable, AbortHandle},
@@ -186,6 +187,7 @@ use tokio::{
     sync::{
         mpsc::{channel, Sender},
         oneshot,
+        RwLock,
     },
     time::sleep,
 };

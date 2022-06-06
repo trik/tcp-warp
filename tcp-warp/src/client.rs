@@ -1,18 +1,49 @@
 use super::*;
 
+type TcpWarpClientConnectionHandlerPtr = Arc<dyn Fn() -> () + Send + Sync>;
+
+type TcpWarpClientConnectionErrorHandlerPtr = Arc<dyn Fn() -> () + Send + Sync>;
+
+type TcpWarpClientDisconnectionHandlerPtr = Arc<dyn Fn() -> () + Send + Sync>;
+
 pub struct TcpWarpClient {
     bind_address: IpAddr,
     tunnel_address: SocketAddr,
+    connection_handlers: RwLock<Vec<TcpWarpClientConnectionHandlerPtr>>,
+    connection_error_handlers: RwLock<Vec<TcpWarpClientConnectionErrorHandlerPtr>>,
+    disconnection_handlers: RwLock<Vec<TcpWarpClientDisconnectionHandlerPtr>>,
+    shutdown: Shutdown,
 }
 
 pub type TcpWarpClientResult = HashMap<Uuid, TcpWarpConnection>;
 
 impl TcpWarpClient {
-    pub fn new(bind_address: IpAddr, tunnel_address: SocketAddr) -> Self {
+    pub fn new(bind_address: IpAddr, tunnel_address: SocketAddr, shutdown: Option<Shutdown>) -> Self {
+        let shutdown = if let Some(shutdown) = shutdown {
+            shutdown
+        } else {
+            Shutdown::new()
+        };
         Self {
             bind_address,
             tunnel_address,
+            connection_handlers: RwLock::new(vec![]),
+            connection_error_handlers: RwLock::new(vec![]),
+            disconnection_handlers: RwLock::new(vec![]),
+            shutdown,
         }
+    }
+
+    pub async fn on_connection(&self, handler: TcpWarpClientConnectionHandlerPtr) -> () {
+        self.connection_handlers.write().await.push(handler);
+    }
+
+    pub async fn on_connection_error(&self, handler: TcpWarpClientConnectionErrorHandlerPtr) -> () {
+        self.connection_error_handlers.write().await.push(handler);
+    }
+
+    pub async fn on_disconnection(&self, handler: TcpWarpClientDisconnectionHandlerPtr) -> () {
+        self.disconnection_handlers.write().await.push(handler);
     }
 
     pub async fn connect(
@@ -20,6 +51,10 @@ impl TcpWarpClient {
         addresses: Vec<TcpWarpPortConnection>,
     ) -> Result<(TcpWarpClientResult, Arc<Vec<TcpWarpPortConnection>>), Box<dyn Error>> {
         self.connect_with(HashMap::new(), Arc::new(addresses)).await
+    }
+
+    pub fn stop(&self) -> () {
+        self.shutdown.shutdown();
     }
 
     pub async fn connect_loop(
@@ -49,125 +84,150 @@ impl TcpWarpClient {
         mut connections: TcpWarpClientResult,
         addresses: Arc<Vec<TcpWarpPortConnection>>,
     ) -> Result<(TcpWarpClientResult, Arc<Vec<TcpWarpPortConnection>>), Box<dyn Error>> {
-        let stream = match TcpStream::connect(&self.tunnel_address).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                error!("cannot connect to tunnel: {}", err);
+        let shutdown = self.shutdown.clone();
+        let stream = match shutdown.wrap_cancel(TcpStream::connect(&self.tunnel_address)).await {
+            Some(res) => match res {
+                Ok(stream) => stream,
+                Err(err) => {
+                    error!("cannot connect to tunnel: {}", err);
+                    return Ok((connections, addresses));
+                },
+            },
+            None => {
+                error!("cannot connect to tunnel");
                 return Ok((connections, addresses));
-            }
+            },
         };
         let (mut wtransport, mut rtransport) = Framed::new(stream, TcpWarpProto).split();
 
         let (sender, mut receiver) = channel(100);
 
-        let forward_task = async move {
+        let forward_task = self.shutdown.clone().wrap_cancel(async move {
             debug!("in receiver task");
 
             let mut listeners = vec![];
 
-            while let Some(message) = receiver.recv().await {
-                debug!("just received a message connect: {:?}", message);
-                let message = match message {
-                    TcpWarpMessage::Connect {
-                        connection_id,
-                        connection,
-                        sender,
-                        connected_sender,
-                    } => {
-                        debug!("adding connection: {}", connection_id);
-                        connections.insert(
+            let shutdown = self.shutdown.clone();
+            while let Some(res) = shutdown.wrap_cancel(receiver.recv()).await {
+                if let Some(message) = res {
+                    debug!("just received a message connect: {:?}", message);
+                    let message = match message {
+                        TcpWarpMessage::Connect {
                             connection_id,
-                            TcpWarpConnection {
-                                sender,
-                                connected_sender: Some(connected_sender),
-                            },
-                        );
-                        TcpWarpMessage::HostConnect {
-                            connection_id,
-                            host: connection.host,
-                            port: connection.port,
-                        }
-                    }
-                    TcpWarpMessage::Listener(abort_handler) => {
-                        listeners.push(abort_handler);
-                        continue;
-                    }
-                    TcpWarpMessage::Disconnect => {
-                        debug!("stopping lesteners...");
-                        for listener in listeners {
-                            listener.abort();
-                        }
-                        debug!("stopped listeners");
-                        break;
-                    }
-                    TcpWarpMessage::DisconnectHost { ref connection_id } => {
-                        if let Some(connection) = connections.remove(connection_id) {
-                            if let Err(err) = connection.sender.send(message).await {
-                                error!("cannot send to channel: {}", err);
-                            }
-                        } else {
-                            error!("connection not found: {}", connection_id);
-                        }
-                        debug!("connections in pool: {}", connections.len());
-                        continue;
-                    }
-                    TcpWarpMessage::ConnectFailure { ref connection_id } => {
-                        if let Some(mut connection) = connections.remove(connection_id) {
-                            if let Some(connection_sender) = connection.connected_sender.take() {
-                                if let Err(err) = connection_sender.send(Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    "disonnect propagated",
-                                ))) {
-                                    error!("cannot send to oneshot channel: {:?}", err);
-                                }
-                            }
-                            if let Err(err) = connection.sender.send(message).await {
-                                error!("cannot send to channel: {}", err);
-                            }
-                        } else {
-                            error!("connection not found: {}", connection_id);
-                        }
-                        debug!("connections in pool: {}", connections.len());
-                        continue;
-                    }
-                    TcpWarpMessage::Connected { ref connection_id } => {
-                        if let Some(connection) = connections.get_mut(connection_id) {
-                            debug!("start connected loop: {}", connection_id);
-                            if let Some(connection_sender) = connection.connected_sender.take() {
-                                if let Err(err) = connection_sender.send(Ok(())) {
-                                    error!("cannot send to oneshot channel: {:?}", err);
-                                }
-                            }
-                        } else {
-                            error!("connection not found: {}", connection_id);
-                        }
-                        continue;
-                    }
-                    TcpWarpMessage::BytesHost {
-                        connection_id,
-                        data,
-                    } => {
-                        if let Some(connection) = connections.get_mut(&connection_id) {
-                            debug!(
-                                "forward message to host port of connection: {}",
-                                connection_id
+                            connection,
+                            sender,
+                            connected_sender,
+                        } => {
+                            debug!("adding connection: {}", connection_id);
+                            connections.insert(
+                                connection_id,
+                                TcpWarpConnection {
+                                    sender,
+                                    connected_sender: Some(connected_sender),
+                                },
                             );
-                            if let Err(err) = connection
-                                .sender
-                                .send(TcpWarpMessage::BytesServer { data })
-                                .await
-                            {
-                                error!("cannot send to channel: {}", err);
+                            TcpWarpMessage::HostConnect {
+                                connection_id,
+                                host: connection.host,
+                                port: connection.port,
                             }
-                        } else {
-                            error!("connection not found: {}", connection_id);
                         }
-                        continue;
+                        TcpWarpMessage::Listener(abort_handler) => {
+                            listeners.push(abort_handler);
+                            continue;
+                        }
+                        TcpWarpMessage::Disconnect => {
+                            debug!("stopping lesteners...");
+                            for listener in listeners {
+                                listener.abort();
+                            }
+                            debug!("stopped listeners");
+                            break;
+                        }
+                        TcpWarpMessage::DisconnectHost { ref connection_id } => {
+                            if let Some(connection) = connections.remove(connection_id) {
+                                if let Err(err) = connection.sender.send(message).await {
+                                    error!("cannot send to channel: {}", err);
+                                } else {
+                                    for handler in self.disconnection_handlers.read().await.iter() {
+                                        handler();
+                                    }
+                                }
+                            } else {
+                                error!("connection not found: {}", connection_id);
+                            }
+                            debug!("connections in pool: {}", connections.len());
+                            continue;
+                        }
+                        TcpWarpMessage::ConnectFailure { ref connection_id } => {
+                            if let Some(mut connection) = connections.remove(connection_id) {
+                                if let Some(connection_sender) = connection.connected_sender.take() {
+                                    if let Err(err) = connection_sender.send(Err(io::Error::new(
+                                        io::ErrorKind::Other,
+                                        "disconnect propagated",
+                                    ))) {
+                                        error!("cannot send to oneshot channel: {:?}", err);
+                                    } else {
+                                        for handler in self.connection_error_handlers.read().await.iter() {
+                                            handler();
+                                        }
+                                    }
+                                }
+                                if let Err(err) = connection.sender.send(message).await {
+                                    error!("cannot send to channel: {}", err);
+                                }
+                            } else {
+                                error!("connection not found: {}", connection_id);
+                            }
+                            debug!("connections in pool: {}", connections.len());
+                            continue;
+                        }
+                        TcpWarpMessage::Connected { ref connection_id } => {
+                            if let Some(connection) = connections.get_mut(connection_id) {
+                                debug!("start connected loop: {}", connection_id);
+                                if let Some(connection_sender) = connection.connected_sender.take() {
+                                    if let Err(err) = connection_sender.send(Ok(())) {
+                                        error!("cannot send to oneshot channel: {:?}", err);
+                                    } else {
+                                        for handler in self.connection_handlers.read().await.iter() {
+                                            handler();
+                                        }
+                                    }
+                                }
+                            } else {
+                                error!("connection not found: {}", connection_id);
+                            }
+                            continue;
+                        }
+                        TcpWarpMessage::BytesHost {
+                            connection_id,
+                            data,
+                        } => {
+                            if let Some(connection) = connections.get_mut(&connection_id) {
+                                debug!(
+                                    "forward message to host port of connection: {}",
+                                    connection_id
+                                );
+                                if let Err(err) = connection
+                                    .sender
+                                    .send(TcpWarpMessage::BytesServer { data })
+                                    .await
+                                {
+                                    error!("cannot send to channel: {}", err);
+                                }
+                            } else {
+                                error!("connection not found: {}", connection_id);
+                            }
+                            continue;
+                        }
+                        regular_message => regular_message,
+                    };
+                    debug!("sending message {:?} from client to tunnel server", message);
+                    let shutdown = self.shutdown.clone();
+                    if let Some(res) = shutdown.wrap_cancel(wtransport.send(message)).await {
+                        res?
                     }
-                    regular_message => regular_message,
-                };
-                debug!("sending message {:?} from client to tunnel server", message);
-                wtransport.send(message).await?;
+                }
             }
 
             debug!("no more messages, closing forward task");
@@ -176,14 +236,22 @@ impl TcpWarpClient {
             receiver.close();
 
             Ok::<TcpWarpClientResult, io::Error>(connections)
-        };
+        }).map(|res| {
+            match res {
+                Some(res) => res,
+                None => return Err(io::Error::new(io::ErrorKind::Other, "")),
+            }
+        });
 
         let bind_address = self.bind_address;
 
         let _addresses = addresses.clone();
-        let processing_task = async move {
-            while let Some(Ok(message)) = rtransport.next().await {
+        let shutdown = self.shutdown.clone();
+        let processing_task = self.shutdown.clone().wrap_cancel(async move {
+            while let Some(Some(Ok(message))) = shutdown.wrap_cancel(rtransport.next()).await {
+                let message_shutdown = self.shutdown.clone();
                 process_host_to_client_message(
+                    message_shutdown,
                     message,
                     sender.clone(),
                     addresses.clone(),
@@ -199,9 +267,15 @@ impl TcpWarpClient {
             }
 
             Ok::<(), io::Error>(())
-        };
+        }).map(|res| {
+            match res {
+                Some(res) => res,
+                None => return Err(io::Error::new(io::ErrorKind::Other, "")),
+            }
+        });
 
         let (connections, _) = try_join!(forward_task, processing_task)?;
+        
 
         Ok((connections, _addresses))
     }
@@ -209,6 +283,7 @@ impl TcpWarpClient {
 
 // async fn publish
 async fn process_host_to_client_message(
+    shutdown: Shutdown,
     message: TcpWarpMessage,
     sender: Sender<TcpWarpMessage>,
     addresses: Arc<Vec<TcpWarpPortConnection>>,
@@ -223,12 +298,13 @@ async fn process_host_to_client_message(
                     SocketAddr::new(bind_address, address.client_port.unwrap_or(address.port));
                 let sender_ = sender.clone();
 
-                let listener = match TcpListener::bind(bind_address).await {
-                    Ok(listener) => listener,
-                    Err(err) => {
+                let listener = match shutdown.wrap_cancel(TcpListener::bind(bind_address)).await {
+                    Some(Ok(listener)) => listener,
+                    Some(Err(err)) => {
                         error!("could not start listen {}: {}", bind_address, err);
-                        return Err(err);
-                    }
+                        return Err(err)
+                    },
+                    None => return Err(io::Error::new(io::ErrorKind::Other, ""))
                 };
 
                 debug!("listen: {:?}", bind_address);
